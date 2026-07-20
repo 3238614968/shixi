@@ -1,4 +1,4 @@
-"""今日校园登录、获取信息。
+"""今日校园登录。
 
 本文件只保留以下链路：
 
@@ -7,12 +7,17 @@
 3. 原生短信验证码登录；
 4. 登录后读取当前账号资料；
 5. 以交互式菜单运行，不保存账号、密码、验证码和 Cookie。
-6. 当前版本仅测试了验证码认证，其他类型因无授权账号未测试。
 
 运行时只需要安装 requests、pycryptodome 和 Pillow。
+一机一号不会出现验证码识别的情况，故不保留验证码识别逻辑。
 
-@ xiaohai
-@ 2026-07-19
+更新内容：
+1. 2024-06-30：修复账号密码登录逻辑。
+2. 2026-07-20：删除验证码识别逻辑，保留账号密码登录和原生短信登录。
+
+@author: xiaohai
+@date: 2026-07-20
+@license: MIT
 """
 
 from __future__ import annotations
@@ -31,12 +36,26 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+RUNTIME_DIR = SCRIPT_DIR / "runtime"
+TEMP_DIR = RUNTIME_DIR / "temp"
+CACHE_DIR = RUNTIME_DIR / "cache"
+CAPTCHA_DIR = RUNTIME_DIR / "captcha"
+for directory in (TEMP_DIR, CACHE_DIR, CAPTCHA_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+for environment_key in ("TEMP", "TMP", "TMPDIR"):
+    os.environ[environment_key] = str(TEMP_DIR)
+os.environ["XDG_CACHE_HOME"] = str(CACHE_DIR)
+tempfile.tempdir = str(TEMP_DIR)
 
 import requests
 from Crypto.Cipher import AES, DES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 from Crypto.Util.Padding import pad, unpad
+from ncc_ocr import NccCaptchaError, NccCaptchaRecognizer
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3 import disable_warnings
@@ -182,9 +201,7 @@ class HttpClient:
         self.webview_version = "108.0.5359.128"
         self.timeout = (10.0, 30.0)
         self.verify_tls = True
-        self.captcha_dir = (
-            Path(tempfile.gettempdir()) / "cpdaily_login_captcha"
-        )
+        self.captcha_dir = CAPTCHA_DIR
         self.session.headers.update(
             {
                 "User-Agent": (
@@ -216,6 +233,32 @@ class HttpClient:
     def set_host(self, host: str) -> None:
         """设置学校业务接口根地址。"""
         self.host = host.rstrip("/") + "/"
+
+    def activate_portal_session(self) -> dict[str, Any]:
+        
+        summary: dict[str, Any] = {"attempted": False}
+        if not self.host:
+            return summary
+        candidates = (
+            urljoin(self.host, "portal/login"),
+            urljoin(self.host, "portal/"),
+            self.host,
+        )
+        errors: list[dict[str, Any]] = []
+        for url in candidates:
+            try:
+                response = self.get(url, allow_redirects=True)
+            except CampusError as exc:
+                errors.append({"url": url, "error": str(exc)})
+                continue
+            summary["attempted"] = True
+            summary["final_url"] = response.url
+            summary["status"] = response.status_code
+            if errors:
+                summary["prior_errors"] = errors
+            return summary
+        summary["errors"] = errors
+        return summary
 
     def make_url(self, path_or_url: str) -> str:
         """把相对地址拼接成完整地址。"""
@@ -290,7 +333,7 @@ class HttpClient:
 
     @staticmethod
     def data_of(body: dict[str, Any]) -> Any:
-        """兼容 data、datas、result 三种数据节点。"""
+        """提取常见的业务数据字段。"""
         for key in ("datas", "data", "result"):
             if key in body:
                 return body[key]
@@ -350,6 +393,7 @@ class HttpClient:
 
 TENANT_LIST_URL = "https://mobile.campushoy.com/v6/config/guest/tenant/list"
 TENANT_INFO_URL = "https://mobile.campushoy.com/v6/config/guest/tenant/info"
+CAMPUS_CAS_SERVICE_URL = "https://mobile.campushoy.com/v6/auth/campus/cas/login"
 
 GENERIC_DOMAIN_LABELS = {
     "www",
@@ -372,14 +416,7 @@ GENERIC_DOMAIN_LABELS = {
 
 
 def parse_account_identity(value: str) -> AccountIdentity:
-    """解析学校线索和真实账号。
-
-    支持以下输入格式：
-    - 学校名称::真实账号
-    - 租户代码|真实账号
-    - 学校域名\真实账号
-    - 校园邮箱
-    """
+    
     account = value.strip()
     hints: list[str] = []
     for separator in ("::", "|", "\\"):
@@ -569,6 +606,32 @@ class TenantService:
     def _resolve_entry(self, tenant: Tenant) -> tuple[str, str]:
         """解析业务域名，并跟随认证入口重定向。"""
         fallback_host = ""
+        wecloud_url = str(tenant.raw.get("wecloudUrl", "") or "")
+        wecloud_parsed = urlparse(wecloud_url)
+        if wecloud_parsed.scheme and wecloud_parsed.netloc:
+            fallback_host = (
+                f"{wecloud_parsed.scheme}://{wecloud_parsed.netloc}/"
+            )
+
+        ids_parsed = urlparse(tenant.ids_url)
+        if (
+            tenant.join_type.upper() == "CLOUD"
+            and ids_parsed.scheme
+            and ids_parsed.netloc
+            and "/iap" in ids_parsed.path.lower()
+        ):
+            if not fallback_host:
+                for entry in (tenant.amp_url, tenant.amp_url2):
+                    parsed_entry = urlparse(entry)
+                    if parsed_entry.scheme and parsed_entry.netloc:
+                        fallback_host = (
+                            f"{parsed_entry.scheme}://{parsed_entry.netloc}/"
+                        )
+                        break
+            if not fallback_host:
+                fallback_host = f"{ids_parsed.scheme}://{ids_parsed.netloc}/"
+            return fallback_host, self._build_iap_login_url(tenant.ids_url)
+
         for entry in (tenant.amp_url, tenant.amp_url2):
             if not entry:
                 continue
@@ -598,6 +661,14 @@ class TenantService:
                 return f"{parsed.scheme}://{parsed.netloc}/", tenant.ids_url
         raise ProtocolError("学校详情没有可用的认证入口")
 
+    @staticmethod
+    def _build_iap_login_url(ids_url: str) -> str:
+        """把学校 idsUrl 转换为今日校园移动端 CAS 登录入口。"""
+        base = ids_url.rstrip("/")
+        if not base.lower().endswith("/login"):
+            base += "/login"
+        return f"{base}?{urlencode({'service': CAMPUS_CAS_SERVICE_URL})}"
+
 
 # ---------------------------------------------------------------------------
 # 统一认证账号密码登录
@@ -612,6 +683,17 @@ class ParsedForm:
     action: str = ""
     method: str = "post"
     inputs: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class IapLoginContext:
+    """一次 IAP 登录页面协商得到的动态字段。"""
+
+    auth_host: str
+    page_url: str
+    lt_hint: str
+    dllt: str
+    public_key_der_b64: str
 
 
 class FormParser(HTMLParser):
@@ -643,15 +725,6 @@ class FormParser(HTMLParser):
             self.current = None
 
 
-def _open_image(path: Path) -> None:
-    """在 Windows 中打开验证码图片。"""
-    try:
-        if os.name == "nt":
-            os.startfile(path)  # type: ignore[attr-defined]
-    except OSError:
-        return
-
-
 def pkcs7_pad(data: bytes, block_size: int) -> bytes:
     """执行 PKCS#7 填充。"""
     count = block_size - len(data) % block_size
@@ -659,7 +732,6 @@ def pkcs7_pad(data: bytes, block_size: int) -> bytes:
 
 
 def encrypt_cas_password(password: str, salt: str) -> str:
-    """实现常见 authserver AES 密码参数算法。"""
     key = salt.encode("utf-8")
     if len(key) not in (16, 24, 32):
         raise ValueError("统一认证 AES 盐值长度异常")
@@ -672,12 +744,33 @@ def encrypt_cas_password(password: str, salt: str) -> str:
     return base64.b64encode(encrypted).decode("ascii")
 
 
+IAP_RSA_PUBLIC_KEY_DER_B64 = (
+    "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDCpbRy8ZoyQvRPpUDIXycglTwV"
+    "DcYrLcv7P9HI4E7/TAPZiI3GN0ckTUVVWRvoo/re3uCOOJK+F+Ufh19XiRIdoPYC"
+    "ULsSyEjcLLiyAS09mVOzhAQco84E/lM24T7rRTVID7LIgWPewyN8Nd5vzHET4Q3q"
+    "TthoL8n82BwC1iXuVQIDAQAB"
+)
+
+
+def encrypt_iap_password(
+    password: str,
+    public_key_der_b64: str = IAP_RSA_PUBLIC_KEY_DER_B64,
+) -> str:
+    try:
+        public_key = RSA.import_key(
+            base64.b64decode(public_key_der_b64, validate=True)
+        )
+    except (ValueError, TypeError, IndexError) as exc:
+        raise ValueError("IAP RSA 公钥格式无效") from exc
+    encrypted = PKCS1_v1_5.new(public_key).encrypt(password.encode("utf-8"))
+    return "{rsa}" + base64.b64encode(encrypted).decode("ascii")
+
+
 def generate_legacy_rsa_password(
     password: str,
     modulus_hex: str,
     exponent_hex: str,
 ) -> str:
-    """实现旧认证页面的反序明文 RSA 算法。"""
     modulus = int(modulus_hex, 16)
     exponent = int(exponent_hex, 16)
     key_size = (modulus.bit_length() + 7) // 8
@@ -699,6 +792,10 @@ class PasswordAuthService:
 
     def __init__(self, http: HttpClient) -> None:
         self.http = http
+        self._captcha_recognizer: NccCaptchaRecognizer | None = None
+        self._iap_public_key_der_b64 = ""
+        self._iap_device_id = http.device_id
+        self._iap_fingerprint_id = uuid.uuid4().hex
 
     def login(self, username: str, password: str, login_url: str) -> None:
         """根据登录地址自动选择认证类型。"""
@@ -713,56 +810,84 @@ class PasswordAuthService:
         password: str,
         login_url: str,
     ) -> None:
-        """执行 IAP 登录。"""
-        parsed = urlparse(login_url)
-        auth_host = f"{parsed.scheme}://{parsed.netloc}/"
-        for attempt in range(1, 4):
-            lt_body = self.http.post_json(
-                urljoin(auth_host, "iap/security/lt"),
-                {},
-                check_http=False,
+        """执行新版 IAP Vue 登录链。"""
+        max_attempts = 3
+        captcha_attempts = 0
+        force_captcha = False
+        while captcha_attempts < max_attempts:
+            context = self._open_iap_context(login_url)
+            ajax_headers = self._iap_ajax_headers(context)
+            lt_response = self.http.post(
+                urljoin(context.auth_host, "iap/security/lt"),
+                data={"lt": context.lt_hint},
+                headers=ajax_headers,
             )
+            try:
+                lt_body = lt_response.json()
+            except ValueError as exc:
+                raise LoginError(
+                    f"IAP 动态票据接口未返回 JSON：HTTP {lt_response.status_code}"
+                ) from exc
             lt = self._find_first(lt_body, {"_lt", "lt", "ltId"})
             if not lt:
                 raise LoginError("IAP 未返回登录票据")
-            need_body = self.http.post_json(
-                urljoin(auth_host, "iap/checkNeedCaptcha"),
-                {"username": username},
-                check_http=False,
+
+            need_value = self._find_first(
+                lt_body,
+                {"needCaptcha", "isNeed", "validation"},
             )
-            need_captcha = self._as_bool(
-                self._find_first(
+            if need_value is None:
+                need_response = self.http.post(
+                    urljoin(context.auth_host, "iap/checkNeedCaptcha"),
+                    data={"username": username, "lt": str(lt)},
+                    headers=ajax_headers,
+                )
+                try:
+                    need_body = need_response.json()
+                except ValueError:
+                    need_body = {}
+                need_value = self._find_first(
                     need_body,
                     {"needCaptcha", "isNeed", "validation"},
                 )
-            )
+            need_captcha = force_captcha or self._as_bool(need_value)
             captcha = ""
             if need_captcha:
+                captcha_attempts += 1
                 captcha = self._read_image_captcha(
-                    urljoin(auth_host, "iap/generateCaptcha"),
+                    urljoin(context.auth_host, "iap/generateCaptcha"),
                     "iap_login",
                     params={"ltId": str(lt)},
                 )
-            params = {
+            form = {
                 "lt": str(lt),
                 "rememberMe": "false",
-                "dllt": "",
+                "dllt": context.dllt,
                 "mobile": "",
                 "username": username,
-                "password": password,
+                "password": encrypt_iap_password(
+                    password,
+                    context.public_key_der_b64,
+                ),
                 "captcha": captcha,
+                "deviceId": self._iap_device_id,
+                "fingerprintId": self._iap_fingerprint_id,
             }
             response = self.http.post(
-                urljoin(auth_host, "iap/doLogin"),
-                params=params,
+                urljoin(context.auth_host, "iap/doLogin"),
+                data=form,
+                headers=self._iap_ajax_headers(
+                    context,
+                    device_id=self._iap_device_id,
+                    fingerprint_id=self._iap_fingerprint_id,
+                ),
                 allow_redirects=False,
             )
             location = response.headers.get("Location")
             if response.is_redirect and location:
-                jump = urljoin(auth_host, location)
-                follow = self.http.post(jump, allow_redirects=True)
-                if follow.status_code == 405:
-                    self.http.get(jump, allow_redirects=True)
+                self._follow_iap_redirect(
+                    urljoin(context.auth_host, location)
+                )
                 return
             try:
                 body = response.json()
@@ -780,17 +905,156 @@ class PasswordAuthService:
                 )
                 or ""
             )
+            jump_value = self._find_first(
+                body,
+                {"url", "redirectUrl", "location"},
+            )
+            if code == "REDIRECT":
+                if not jump_value:
+                    raise LoginError("IAP 登录成功响应缺少跳转地址")
+                self._follow_iap_redirect(
+                    urljoin(context.auth_host, str(jump_value))
+                )
+                return
+            if code in {"SUCCESS", "OK", "200"}:
+                if jump_value:
+                    self._follow_iap_redirect(
+                        urljoin(context.auth_host, str(jump_value))
+                    )
+                return
             if code in {"FAIL_UPNOTMATCH", "UPNOTMATCH"}:
                 raise LoginError("用户名或密码不匹配")
             if code in {"CAPTCHA_NOTMATCH", "CAPTCHA_ERROR"} or self._is_captcha_error(
                 message
             ):
-                if attempt < 3:
-                    print(f"登录验证码未通过，正在刷新（{attempt + 1}/3）。")
+                force_captcha = True
+                if captcha_attempts < max_attempts:
+                    print(
+                        "登录验证码未通过，正在刷新票据和图片"
+                        f"（{captcha_attempts + 1}/{max_attempts}）。"
+                    )
                     continue
                 raise LoginError("登录验证码多次不匹配")
             raise LoginError(f"IAP 登录失败：{message or code or '未知错误'}")
         raise LoginError("IAP 登录失败")
+
+    def _open_iap_context(self, login_url: str) -> IapLoginContext:
+        """访问 IAP 登录入口并读取动态 LT、来源页和 RSA 公钥。"""
+        response = self.http.get(
+            login_url,
+            allow_redirects=True,
+            headers={
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,image/apng,*/*;q=0.8"
+                ),
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Upgrade-Insecure-Requests": "1",
+                "cpdailyauthtype": "Login",
+                "X-Requested-With": "com.wisedu.cpdaily",
+            },
+        )
+        page_url = response.url or login_url
+        parsed = urlparse(page_url)
+        if not parsed.scheme or not parsed.netloc:
+            parsed = urlparse(login_url)
+            page_url = login_url
+        if not parsed.scheme or not parsed.netloc:
+            raise LoginError("IAP 登录地址格式无效")
+        query = parse_qs(parsed.query)
+        if not query:
+            query = parse_qs(urlparse(login_url).query)
+        lt_hint = str((query.get("_2lBepC") or query.get("lt") or [""])[0])
+        dllt = str((query.get("_dllt") or query.get("dllt") or ["cpdaily"])[0])
+        return IapLoginContext(
+            auth_host=f"{parsed.scheme}://{parsed.netloc}/",
+            page_url=page_url,
+            lt_hint=lt_hint,
+            dllt=dllt or "cpdaily",
+            public_key_der_b64=self._discover_iap_public_key(
+                page_url,
+                response.text,
+            ),
+        )
+
+    def _discover_iap_public_key(self, page_url: str, html: str) -> str:
+        """优先从当前登录前端发现公钥，并保留归档公钥作为兼容值。"""
+        if self._iap_public_key_der_b64:
+            return self._iap_public_key_der_b64
+        key = self._extract_iap_public_key(html)
+        if key:
+            self._iap_public_key_der_b64 = key
+            return key
+        script_urls = re.findall(
+            r"<script[^>]+src=[\"']([^\"']+)[\"']",
+            html,
+            re.I,
+        )
+        script_urls.sort(
+            key=lambda value: (
+                "chunk-common" not in value.lower(),
+                "common" not in value.lower(),
+            )
+        )
+        for script_url in script_urls[:8]:
+            try:
+                script_response = self.http.get(
+                    urljoin(page_url, script_url),
+                    headers={"Referer": page_url},
+                )
+            except Exception:
+                continue
+            key = self._extract_iap_public_key(script_response.text)
+            if key:
+                self._iap_public_key_der_b64 = key
+                return key
+        self._iap_public_key_der_b64 = IAP_RSA_PUBLIC_KEY_DER_B64
+        return self._iap_public_key_der_b64
+
+    @staticmethod
+    def _extract_iap_public_key(source: str) -> str:
+        """从压缩 JavaScript 中筛选可导入的 DER Base64 RSA 公钥。"""
+        for candidate in re.findall(
+            r"(?<![A-Za-z0-9+/])(MIG[A-Za-z0-9+/]{160,360}={0,2})",
+            source,
+        ):
+            try:
+                padding = "=" * (-len(candidate) % 4)
+                key = RSA.import_key(base64.b64decode(candidate + padding))
+            except (ValueError, TypeError, IndexError):
+                continue
+            if key.size_in_bits() >= 1024:
+                return candidate
+        return ""
+
+    @staticmethod
+    def _iap_ajax_headers(
+        context: IapLoginContext,
+        *,
+        device_id: str = "",
+        fingerprint_id: str = "",
+    ) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": context.auth_host.rstrip("/"),
+            "Referer": context.page_url,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if device_id:
+            headers["deviceId"] = device_id
+        if fingerprint_id:
+            headers["fingerprintId"] = fingerprint_id
+        return headers
+
+    def _follow_iap_redirect(self, jump_url: str) -> None:
+        response = self.http.get(jump_url, allow_redirects=True)
+        if response.status_code == 405:
+            response = self.http.post(jump_url, allow_redirects=True)
+        if response.status_code >= 400:
+            raise LoginError(
+                f"IAP 服务票据跳转失败：HTTP {response.status_code}"
+            )
 
     def _login_cas(
         self,
@@ -908,321 +1172,330 @@ class PasswordAuthService:
                 return form
         return None
 
-    def _cas_needs_captcha(
-        self,
-        login_url: str,
-        username: str,
-        form_id: str,
-    ) -> bool:
-        """兼容两类 authserver 验证码检查接口。"""
-        parsed = urlparse(login_url)
-        host = f"{parsed.scheme}://{parsed.netloc}/"
-        try:
-            if form_id == "casloginform":
-                check = self.http.get(
-                    urljoin(host, "authserver/needCaptcha.html"),
-                    params={"username": username},
-                )
-                return "false" not in check.text.lower()
-            check = self.http.get(
-                urljoin(host, "authserver/checkNeedCaptcha.htl"),
-                params={"username": username},
-            )
-            body = check.json()
-            return bool(body.get("isNeed", body.get("needCaptcha", False)))
-        except Exception:
-            return False
+    # def _cas_needs_captcha(
+    #     self,
+    #     login_url: str,
+    #     username: str,
+    #     form_id: str,
+    # ) -> bool:
+    #     parsed = urlparse(login_url)
+    #     host = f"{parsed.scheme}://{parsed.netloc}/"
+    #     try:
+    #         if form_id == "casloginform":
+    #             check = self.http.get(
+    #                 urljoin(host, "authserver/needCaptcha.html"),
+    #                 params={"username": username},
+    #             )
+    #             return "false" not in check.text.lower()
+    #         check = self.http.get(
+    #             urljoin(host, "authserver/checkNeedCaptcha.htl"),
+    #             params={"username": username},
+    #         )
+    #         body = check.json()
+    #         return bool(body.get("isNeed", body.get("needCaptcha", False)))
+    #     except Exception:
+    #         return False
 
-    def _fill_cas_captcha(
-        self,
-        params: dict[str, str],
-        login_url: str,
-        form_id: str,
-        html: str,
-        captcha_name: str,
-    ) -> None:
-        """处理字符验证码或滑块验证码。"""
-        parsed = urlparse(login_url)
-        host = f"{parsed.scheme}://{parsed.netloc}/"
-        if "sliderCaptchaDiv" in html:
-            create_url = urljoin(
-                host,
-                "authserver/common/openSliderCaptcha.htl",
-            )
-            verify_url = urljoin(
-                host,
-                "authserver/common/verifySliderCaptcha.htl",
-            )
-            body = self.http.get(create_url).json()
-            small_value = str(
-                self._find_first(
-                    body,
-                    {"smallImage", "smallImg", "sliderImage"},
-                )
-                or ""
-            )
-            big_value = str(
-                self._find_first(
-                    body,
-                    {"bigImage", "bigImg", "backgroundImage"},
-                )
-                or ""
-            )
-            small = self._save_base64_image(small_value, "slider_small")
-            big = self._save_base64_image(big_value, "slider_big")
-            print(f"滑块图：{small}")
-            print(f"背景图：{big}")
-            canvas_value = self._find_first(
-                body,
-                {"canvasLength", "canvasWidth", "imageWidth", "width"},
-            )
-            try:
-                canvas_length = int(float(str(canvas_value)))
-            except (TypeError, ValueError):
-                canvas_length = 280
-            move = int(
-                input(
-                    f"请输入在 {canvas_length} 像素画布上的滑动距离："
-                ).strip()
-            )
-            verify_data = self._collect_challenge_fields(body)
-            verify_data.update(
-                {
-                    "canvasLength": canvas_length,
-                    "moveLength": move,
-                }
-            )
-            verify = self.http.post(verify_url, data=verify_data)
-            if verify.status_code >= 400:
-                raise LoginError("滑块验证码提交失败")
-            try:
-                verify_body = verify.json()
-            except ValueError:
-                verify_body = {"message": verify.text}
-            success = self._find_first(
-                verify_body,
-                {"success", "isSuccess", "validated", "valid"},
-            )
-            if success is not None and not self._as_bool(success):
-                raise LoginError("滑块验证码校验未通过")
-            params.update(self._collect_proof_fields(verify_body))
-            return
-        captcha_url = (
-            "authserver/captcha.html"
-            if form_id == "casloginform"
-            else "authserver/getCaptcha.htl"
-        )
-        params[captcha_name] = self._read_image_captcha(
-            urljoin(host, captcha_url),
-            "cas_login",
-        )
+    # def _fill_cas_captcha(
+    #     self,
+    #     params: dict[str, str],
+    #     login_url: str,
+    #     form_id: str,
+    #     html: str,
+    #     captcha_name: str,
+    # ) -> None:
+    #     parsed = urlparse(login_url)
+    #     host = f"{parsed.scheme}://{parsed.netloc}/"
+    #     if "sliderCaptchaDiv" in html:
+    #         create_url = urljoin(
+    #             host,
+    #             "authserver/common/openSliderCaptcha.htl",
+    #         )
+    #         verify_url = urljoin(
+    #             host,
+    #             "authserver/common/verifySliderCaptcha.htl",
+    #         )
+    #         body = self.http.get(create_url).json()
+    #         small_value = str(
+    #             self._find_first(
+    #                 body,
+    #                 {"smallImage", "smallImg", "sliderImage"},
+    #             )
+    #             or ""
+    #         )
+    #         big_value = str(
+    #             self._find_first(
+    #                 body,
+    #                 {"bigImage", "bigImg", "backgroundImage"},
+    #             )
+    #             or ""
+    #         )
+    #         small = self._save_base64_image(small_value, "slider_small")
+    #         big = self._save_base64_image(big_value, "slider_big")
+    #         print(f"滑块图：{small}")
+    #         print(f"背景图：{big}")
+    #         canvas_value = self._find_first(
+    #             body,
+    #             {"canvasLength", "canvasWidth", "imageWidth", "width"},
+    #         )
+    #         try:
+    #             canvas_length = int(float(str(canvas_value)))
+    #         except (TypeError, ValueError):
+    #             canvas_length = 280
+    #         move = int(
+    #             input(
+    #                 f"请输入在 {canvas_length} 像素画布上的滑动距离："
+    #             ).strip()
+    #         )
+    #         verify_data = self._collect_challenge_fields(body)
+    #         verify_data.update(
+    #             {
+    #                 "canvasLength": canvas_length,
+    #                 "moveLength": move,
+    #             }
+    #         )
+    #         verify = self.http.post(verify_url, data=verify_data)
+    #         if verify.status_code >= 400:
+    #             raise LoginError("滑块验证码提交失败")
+    #         try:
+    #             verify_body = verify.json()
+    #         except ValueError:
+    #             verify_body = {"message": verify.text}
+    #         success = self._find_first(
+    #             verify_body,
+    #             {"success", "isSuccess", "validated", "valid"},
+    #         )
+    #         if success is not None and not self._as_bool(success):
+    #             raise LoginError("滑块验证码校验未通过")
+    #         params.update(self._collect_proof_fields(verify_body))
+    #         return
+    #     captcha_url = (
+    #         "authserver/captcha.html"
+    #         if form_id == "casloginform"
+    #         else "authserver/getCaptcha.htl"
+    #     )
+    #     params[captcha_name] = self._read_image_captcha(
+    #         urljoin(host, captcha_url),
+    #         "cas_login",
+    #     )
 
-    def _read_image_captcha(
-        self,
-        url: str,
-        name: str,
-        *,
-        params: dict[str, str] | None = None,
-    ) -> str:
-        """下载字符验证码并让用户输入。"""
-        response = self.http.get(url, params=params)
-        if response.status_code >= 400:
-            raise LoginError(f"验证码下载失败：HTTP {response.status_code}")
-        path = self._captcha_path(name)
-        path.write_bytes(response.content)
-        _open_image(path)
-        return input(
-            f"验证码已保存到 {path}，请输入图片字符："
-        ).strip()
+    # def _read_image_captcha(
+    #     self,
+    #     url: str,
+    #     name: str,
+    #     *,
+    #     params: dict[str, str] | None = None,
+    # ) -> str:
+    #     response = self.http.get(url, params=params)
+    #     if response.status_code >= 400:
+    #         raise LoginError(f"验证码下载失败：HTTP {response.status_code}")
+    #     path = self._captcha_path(name)
+    #     path.write_bytes(response.content)
+    #     try:
+    #         if self._captcha_recognizer is None:
+    #             self._captcha_recognizer = NccCaptchaRecognizer()
+    #         result = self._captcha_recognizer.recognize_bytes(
+    #             response.content,
+    #             expected_length=5 if name == "iap_login" else 4,
+    #         )
+    #     except NccCaptchaError as exc:
+    #         raise LoginError(
+    #             f"NCC 验证码自动识别失败，原图已保存到 {path}：{exc}"
+    #         ) from exc
+    #     print(
+    #         f"NCC 验证码自动识别：{result.text} "
+    #         f"（最低匹配分 {result.min_score:.3f}，"
+    #         f"最低区分度 {result.min_margin:.3f}；原图 {path}）"
+    #     )
+    #     return result.text
 
-    def _save_base64_image(self, value: str, name: str) -> Path:
-        """保存并校验 Base64 图片。"""
-        if not value:
-            raise ProtocolError(f"服务端未返回{name}图片")
-        if "," in value:
-            value = value.split(",", 1)[1]
-        try:
-            raw = base64.b64decode(value)
-        except (ValueError, TypeError) as exc:
-            raise ProtocolError("验证码图片 Base64 无效") from exc
-        path = self._captcha_path(name)
-        path.write_bytes(raw)
-        try:
-            with Image.open(path) as image:
-                image.verify()
-        except Exception as exc:
-            raise ProtocolError("服务端返回的验证码图片无效") from exc
-        _open_image(path)
-        return path
+    # def _save_base64_image(self, value: str, name: str) -> Path:
+    #     """保存并校验 Base64 图片。"""
+    #     if not value:
+    #         raise ProtocolError(f"服务端未返回{name}图片")
+    #     if "," in value:
+    #         value = value.split(",", 1)[1]
+    #     try:
+    #         raw = base64.b64decode(value)
+    #     except (ValueError, TypeError) as exc:
+    #         raise ProtocolError("验证码图片 Base64 无效") from exc
+    #     path = self._captcha_path(name)
+    #     path.write_bytes(raw)
+    #     try:
+    #         with Image.open(path) as image:
+    #             image.verify()
+    #     except Exception as exc:
+    #         raise ProtocolError("服务端返回的验证码图片无效") from exc
+    #     return path
 
-    def _captcha_path(self, name: str) -> Path:
-        """生成临时验证码图片路径。"""
-        self.http.captcha_dir.mkdir(parents=True, exist_ok=True)
-        stamp = f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
-        safe_name = re.sub(r"[^0-9A-Za-z_-]+", "_", name)
-        return self.http.captcha_dir / f"{safe_name}_{stamp}.png"
+    # def _captcha_path(self, name: str) -> Path:
+    #     """生成临时验证码图片路径。"""
+    #     self.http.captcha_dir.mkdir(parents=True, exist_ok=True)
+    #     stamp = f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
+    #     safe_name = re.sub(r"[^0-9A-Za-z_-]+", "_", name)
+    #     return self.http.captcha_dir / f"{safe_name}_{stamp}.png"
 
-    @staticmethod
-    def _find_first(node: Any, names: set[str]) -> Any:
-        """递归查找接口响应中的字段。"""
-        lowered = {name.casefold() for name in names}
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if str(key).casefold() in lowered:
-                    return value
-            for value in node.values():
-                found = PasswordAuthService._find_first(value, names)
-                if found is not None:
-                    return found
-        elif isinstance(node, list):
-            for value in node:
-                found = PasswordAuthService._find_first(value, names)
-                if found is not None:
-                    return found
-        return None
+    # @staticmethod
+    # def _find_first(node: Any, names: set[str]) -> Any:
+    #     """递归查找接口响应中的字段。"""
+    #     lowered = {name.casefold() for name in names}
+    #     if isinstance(node, dict):
+    #         for key, value in node.items():
+    #             if str(key).casefold() in lowered:
+    #                 return value
+    #         for value in node.values():
+    #             found = PasswordAuthService._find_first(value, names)
+    #             if found is not None:
+    #                 return found
+    #     elif isinstance(node, list):
+    #         for value in node:
+    #             found = PasswordAuthService._find_first(value, names)
+    #             if found is not None:
+    #                 return found
+    #     return None
 
-    @staticmethod
-    def _as_bool(value: Any) -> bool:
-        """兼容多种布尔表达方式。"""
-        if isinstance(value, dict):
-            return PasswordAuthService._as_bool(
-                PasswordAuthService._find_first(
-                    value,
-                    {"success", "isSuccess", "needCaptcha", "isNeed"},
-                )
-            )
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value != 0
-        return str(value or "").strip().casefold() in {
-            "1",
-            "true",
-            "yes",
-            "success",
-            "ok",
-            "需要",
-        }
+    # @staticmethod
+    # def _as_bool(value: Any) -> bool:
+    #     """兼容多种布尔表达方式。"""
+    #     if isinstance(value, dict):
+    #         return PasswordAuthService._as_bool(
+    #             PasswordAuthService._find_first(
+    #                 value,
+    #                 {"success", "isSuccess", "needCaptcha", "isNeed"},
+    #             )
+    #         )
+    #     if isinstance(value, bool):
+    #         return value
+    #     if isinstance(value, (int, float)):
+    #         return value != 0
+    #     return str(value or "").strip().casefold() in {
+    #         "1",
+    #         "true",
+    #         "yes",
+    #         "success",
+    #         "ok",
+    #         "需要",
+    #     }
 
-    @staticmethod
-    def _is_captcha_error(value: str) -> bool:
-        """识别验证码错误文本。"""
-        lowered = str(value or "").casefold()
-        return any(
-            word in lowered
-            for word in ("captcha", "验证码", "校验码", "滑块")
-        )
+    # @staticmethod
+    # def _is_captcha_error(value: str) -> bool:
+    #     """识别验证码错误文本。"""
+    #     lowered = str(value or "").casefold()
+    #     return any(
+    #         word in lowered
+    #         for word in ("captcha", "验证码", "校验码", "滑块")
+    #     )
 
-    @staticmethod
-    def _captcha_input_name(
-        form: ParsedForm,
-        form_id: str,
-    ) -> str:
-        """动态识别验证码字段名。"""
-        for item in form.inputs:
-            name = item.get("name", "")
-            lowered = name.casefold()
-            if name and any(
-                word in lowered
-                for word in (
-                    "captcha",
-                    "verifycode",
-                    "validatecode",
-                    "randcode",
-                )
-            ):
-                return name
-        return "captchaResponse" if form_id == "casloginform" else "captcha"
+    # @staticmethod
+    # def _captcha_input_name(
+    #     form: ParsedForm,
+    #     form_id: str,
+    # ) -> str:
+    #     """动态识别验证码字段名。"""
+    #     for item in form.inputs:
+    #         name = item.get("name", "")
+    #         lowered = name.casefold()
+    #         if name and any(
+    #             word in lowered
+    #             for word in (
+    #                 "captcha",
+    #                 "verifycode",
+    #                 "validatecode",
+    #                 "randcode",
+    #             )
+    #         ):
+    #             return name
+    #     return "captchaResponse" if form_id == "casloginform" else "captcha"
 
-    @staticmethod
-    def _collect_challenge_fields(node: Any) -> dict[str, Any]:
-        """提取滑块验证所需的动态字段。"""
-        fields: dict[str, Any] = {}
-        excluded = {
-            "smallimage",
-            "smallimg",
-            "sliderimage",
-            "bigimage",
-            "bigimg",
-            "backgroundimage",
-            "message",
-            "msg",
-            "status",
-            "success",
-        }
+    # @staticmethod
+    # def _collect_challenge_fields(node: Any) -> dict[str, Any]:
+    #     """提取滑块验证所需的动态字段。"""
+    #     fields: dict[str, Any] = {}
+    #     excluded = {
+    #         "smallimage",
+    #         "smallimg",
+    #         "sliderimage",
+    #         "bigimage",
+    #         "bigimg",
+    #         "backgroundimage",
+    #         "message",
+    #         "msg",
+    #         "status",
+    #         "success",
+    #     }
 
-        def walk(value: Any) -> None:
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    lowered = str(key).casefold()
-                    if isinstance(child, (str, int, float, bool)):
-                        if (
-                            lowered not in excluded
-                            and any(
-                                marker in lowered
-                                for marker in (
-                                    "token",
-                                    "uuid",
-                                    "session",
-                                    "captchakey",
-                                    "challenge",
-                                    "sliderid",
-                                )
-                            )
-                        ):
-                            fields[str(key)] = child
-                    else:
-                        walk(child)
-            elif isinstance(value, list):
-                for child in value:
-                    walk(child)
+    #     def walk(value: Any) -> None:
+    #         if isinstance(value, dict):
+    #             for key, child in value.items():
+    #                 lowered = str(key).casefold()
+    #                 if isinstance(child, (str, int, float, bool)):
+    #                     if (
+    #                         lowered not in excluded
+    #                         and any(
+    #                             marker in lowered
+    #                             for marker in (
+    #                                 "token",
+    #                                 "uuid",
+    #                                 "session",
+    #                                 "captchakey",
+    #                                 "challenge",
+    #                                 "sliderid",
+    #                             )
+    #                         )
+    #                     ):
+    #                         fields[str(key)] = child
+    #                 else:
+    #                     walk(child)
+    #         elif isinstance(value, list):
+    #             for child in value:
+    #                 walk(child)
 
-        walk(node)
-        return fields
+    #     walk(node)
+    #     return fields
 
-    @staticmethod
-    def _collect_proof_fields(node: Any) -> dict[str, str]:
-        """提取滑块验证返回的票据字段。"""
-        fields: dict[str, str] = {}
+    # @staticmethod
+    # def _collect_proof_fields(node: Any) -> dict[str, str]:
+    #     """提取滑块验证返回的票据字段。"""
+    #     fields: dict[str, str] = {}
 
-        def walk(value: Any) -> None:
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    lowered = str(key).casefold()
-                    if isinstance(child, (str, int, float)) and any(
-                        marker in lowered
-                        for marker in (
-                            "ticket",
-                            "token",
-                            "validate",
-                            "captcha",
-                            "proof",
-                        )
-                    ):
-                        fields[str(key)] = str(child)
-                    elif isinstance(child, (dict, list)):
-                        walk(child)
-            elif isinstance(value, list):
-                for child in value:
-                    walk(child)
+    #     def walk(value: Any) -> None:
+    #         if isinstance(value, dict):
+    #             for key, child in value.items():
+    #                 lowered = str(key).casefold()
+    #                 if isinstance(child, (str, int, float)) and any(
+    #                     marker in lowered
+    #                     for marker in (
+    #                         "ticket",
+    #                         "token",
+    #                         "validate",
+    #                         "captcha",
+    #                         "proof",
+    #                     )
+    #                 ):
+    #                     fields[str(key)] = str(child)
+    #                 elif isinstance(child, (dict, list)):
+    #                     walk(child)
+    #         elif isinstance(value, list):
+    #             for child in value:
+    #                 walk(child)
 
-        walk(node)
-        return fields
+    #     walk(node)
+    #     return fields
 
-    @staticmethod
-    def _extract_error(html: str) -> str:
-        """提取认证页面中的错误文本。"""
-        for pattern in (
-            r'id=["\']errorMsg["\'][^>]*>(.*?)<',
-            r'id=["\']msg["\'][^>]*>(.*?)<',
-            r'class=["\'][^"\']*authError[^"\']*["\'][^>]*>(.*?)<',
-            r'id=["\']formErrorTip2["\'][^>]*>(.*?)<',
-            r'id=["\']showErrorTip["\'][^>]*>(.*?)<',
-        ):
-            match = re.search(pattern, html, re.I | re.S)
-            if match:
-                return re.sub(r"<[^>]+>", "", match.group(1)).strip()
-        return ""
+    # @staticmethod
+    # def _extract_error(html: str) -> str:
+    #     """提取认证页面中的错误文本。"""
+    #     for pattern in (
+    #         r'id=["\']errorMsg["\'][^>]*>(.*?)<',
+    #         r'id=["\']msg["\'][^>]*>(.*?)<',
+    #         r'class=["\'][^"\']*authError[^"\']*["\'][^>]*>(.*?)<',
+    #         r'id=["\']formErrorTip2["\'][^>]*>(.*?)<',
+    #         r'id=["\']showErrorTip["\'][^>]*>(.*?)<',
+    #     ):
+    #         match = re.search(pattern, html, re.I | re.S)
+    #         if match:
+    #             return re.sub(r"<[^>]+>", "", match.group(1)).strip()
+    #     return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1762,9 +2035,6 @@ class NativeSmsAuthService:
         if not isinstance(profile, dict):
             raise ProtocolError("短信验证码登录响应不是对象")
 
-        # 这里先判断业务状态，再读取会话字段。
-        # 某些响应虽然带有同名空字段或临时字段，但 authStatus=noauth
-        # 时仍然没有真正建立可用会话。
         if self._is_unregistered_or_unbound(profile):
             raise LoginError("账号未注册或未绑定学校")
 
@@ -1882,6 +2152,8 @@ class AccountInfoService:
         "https://mobile.campushoy.com/",
     )
     DEFAULT_ENDPOINTS = (
+        "wec-counselor-stuinfo-apps/student/detail/getStuMainMustInfos",
+        "wec-im-group/group/groupMember/getCurrentUserId",
         "wec-portal-mobile/client/user/getUserInfo",
         "wec-portal-mobile/client/user/queryUserInfo",
         "wec-portal-mobile/client/user/getUserBaseInfo",
@@ -1950,26 +2222,36 @@ class AccountInfoService:
                         body = self.http.post_json(
                             endpoint,
                             {},
+                            headers=self._school_profile_headers(),
                             check_http=False,
                         )
                     else:
-                        raw = self.http.get(endpoint)
+                        raw = self.http.get(
+                            endpoint,
+                            headers=self._school_profile_headers(),
+                        )
                         if raw.status_code >= 400:
                             continue
                         body = raw.json()
                     data = self.http.data_of(body)
-                    if isinstance(data, dict) and data:
+                    profile = self._profile_object(data)
+                    if profile and not self._is_unauthenticated(profile):
                         return {
                             "source": endpoint,
                             "method": method,
                             "username": username,
-                            "profile": data,
+                            "profile": self._normalize_profile(profile),
                         }
                     attempts.append(
                         {
                             "endpoint": endpoint,
                             "method": method,
-                            "status": "empty",
+                            "status": (
+                                "unauthenticated"
+                                if profile
+                                and self._is_unauthenticated(profile)
+                                else "empty"
+                            ),
                         }
                     )
                 except Exception as exc:
@@ -1981,6 +2263,11 @@ class AccountInfoService:
                         }
                     )
 
+        unauthenticated = [
+            item
+            for item in attempts
+            if item.get("status") == "unauthenticated"
+        ]
         result: dict[str, Any] = {
             "source": "local-session",
             "username": username,
@@ -1989,8 +2276,81 @@ class AccountInfoService:
             ),
             "probe_attempts": attempts,
         }
+        if unauthenticated:
+            result["warning"] = (
+                "统一认证已通过，但应用侧会话未建立：所有学校资料接口均"
+                "返回未登录占位响应，可能是 portal 入口未激活或该学校"
+                "需要额外的应用授权。"
+            )
         if tenant is not None:
             result["school"] = tenant.to_dict()
+        return result
+
+    def _school_profile_headers(self) -> dict[str, str]:
+        """构造与学校 H5 资料页相同的只读 AJAX 请求头。"""
+        origin = str(self.http.host or "").rstrip("/")
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if origin:
+            headers["Origin"] = origin
+            headers["Referer"] = f"{origin}/"
+        return headers
+
+    @staticmethod
+    def _is_unauthenticated(profile: dict[str, Any]) -> bool:
+        """识别服务端返回的“未登录/需要跳转登录”占位响应。
+
+        典型形态：{"WEC-HASLOGIN": false, "WEC-REDIRECTURL": "/portal/login"}，
+        这类非空字典曾被误判为有效资料，需要单独拦截。
+        """
+        if not any(
+            str(key).upper().startswith("WEC-") for key in profile
+        ):
+            return False
+        has_login = profile.get("WEC-HASLOGIN")
+        if isinstance(has_login, bool) and not has_login:
+            return True
+        redirect = profile.get("WEC-REDIRECTURL")
+        if isinstance(redirect, str) and redirect:
+            return True
+        return all(not value for value in profile.values())
+
+    @staticmethod
+    def _profile_object(data: Any) -> dict[str, Any]:
+        """兼容资料接口返回对象或仅包含当前学生的一项列表。"""
+        if isinstance(data, dict) and data:
+            return data
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and item:
+                    return item
+        return {}
+
+    @staticmethod
+    def _normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
+        """补充统一字段名，同时保留学校接口的原始字段。"""
+        result = dict(profile)
+        aliases = {
+            "name": ("name", "userName"),
+            "student_no": ("studentNo", "studentId", "xh"),
+            "user_id": ("userId", "userWid", "personId", "openId"),
+            "academy": ("academy", "department", "dwmc"),
+            "major": ("major", "zymc"),
+            "class_name": ("className", "bjmc"),
+            "grade": ("grade", "nj"),
+            "mobile": ("mobile", "mobilePhone", "phone"),
+            "school_zone": ("schoolZone", "campusName"),
+        }
+        for normalized, candidates in aliases.items():
+            if result.get(normalized) not in (None, ""):
+                continue
+            for candidate in candidates:
+                value = profile.get(candidate)
+                if value not in (None, ""):
+                    result[normalized] = value
+                    break
         return result
 
     @staticmethod
@@ -2032,7 +2392,7 @@ class InteractiveLoginApp:
     def run(self) -> None:
         """运行交互式菜单。"""
         print("=" * 58)
-        print("今日校园登录系统")
+        print("今日校园登录")
         print("本脚本只执行登录和信息读取，不执行打卡、补签、日报或其他操作")
         print("=" * 58)
         while True:
@@ -2082,6 +2442,12 @@ class InteractiveLoginApp:
             password,
             school.login_url,
         )
+        activation = self.http.activate_portal_session()
+        status = activation.get("status")
+        if not activation.get("attempted") or (
+            isinstance(status, int) and status >= 400
+        ):
+            print("提示：未能成功激活应用会话，资料接口可能仍返回未登录。")
         result = self.account_info.get_current(
             identity.login_name,
             school,
