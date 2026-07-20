@@ -8,12 +8,13 @@
 4. 登录后读取当前账号资料；
 5. 以交互式菜单运行，不保存账号、密码、验证码和 Cookie。
 
-运行时只需要安装 requests、pycryptodome 和 Pillow。
-一机一号不会出现验证码识别的情况，故不保留验证码识别逻辑。
+运行时只需要安装 requests 和 pycryptodome。
+本脚本不提供验证码识别、验证码绕过或风控规避功能；若服务端要求图形验证码或滑块验证，脚本会停止当前登录流程。
 
 更新内容：
 1. 2024-06-30：修复账号密码登录逻辑。
 2. 2026-07-20：删除验证码识别逻辑，保留账号密码登录和原生短信登录。
+3. 2026-07-20：修复删除 OCR 后遗留的方法调用和启动依赖错误。
 
 @author: xiaohai
 @date: 2026-07-20
@@ -43,8 +44,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = SCRIPT_DIR / "runtime"
 TEMP_DIR = RUNTIME_DIR / "temp"
 CACHE_DIR = RUNTIME_DIR / "cache"
-CAPTCHA_DIR = RUNTIME_DIR / "captcha"
-for directory in (TEMP_DIR, CACHE_DIR, CAPTCHA_DIR):
+for directory in (TEMP_DIR, CACHE_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 for environment_key in ("TEMP", "TMP", "TMPDIR"):
     os.environ[environment_key] = str(TEMP_DIR)
@@ -55,8 +55,6 @@ import requests
 from Crypto.Cipher import AES, DES, PKCS1_v1_5
 from Crypto.PublicKey import RSA
 from Crypto.Util.Padding import pad, unpad
-from ncc_ocr import NccCaptchaError, NccCaptchaRecognizer
-from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3 import disable_warnings
 from urllib3.exceptions import InsecureRequestWarning
@@ -201,7 +199,6 @@ class HttpClient:
         self.webview_version = "108.0.5359.128"
         self.timeout = (10.0, 30.0)
         self.verify_tls = True
-        self.captcha_dir = CAPTCHA_DIR
         self.session.headers.update(
             {
                 "User-Agent": (
@@ -792,7 +789,6 @@ class PasswordAuthService:
 
     def __init__(self, http: HttpClient) -> None:
         self.http = http
-        self._captcha_recognizer: NccCaptchaRecognizer | None = None
         self._iap_public_key_der_b64 = ""
         self._iap_device_id = http.device_id
         self._iap_fingerprint_id = uuid.uuid4().hex
@@ -810,38 +806,44 @@ class PasswordAuthService:
         password: str,
         login_url: str,
     ) -> None:
-        """执行新版 IAP Vue 登录链。"""
-        max_attempts = 3
-        captcha_attempts = 0
-        force_captcha = False
-        while captcha_attempts < max_attempts:
-            context = self._open_iap_context(login_url)
-            ajax_headers = self._iap_ajax_headers(context)
-            lt_response = self.http.post(
-                urljoin(context.auth_host, "iap/security/lt"),
-                data={"lt": context.lt_hint},
+        """执行新版 IAP Vue 登录链。
+
+        本项目不处理图形验证码和滑块验证。服务端要求验证码时，
+        立即停止当前流程，避免误导使用者认为脚本能够绕过验证。
+        """
+        context = self._open_iap_context(login_url)
+        ajax_headers = self._iap_ajax_headers(context)
+        lt_response = self.http.post(
+            urljoin(context.auth_host, "iap/security/lt"),
+            data={"lt": context.lt_hint},
+            headers=ajax_headers,
+        )
+        if lt_response.status_code >= 400:
+            raise LoginError(
+                f"IAP 动态票据接口返回 HTTP {lt_response.status_code}"
+            )
+        try:
+            lt_body = lt_response.json()
+        except ValueError as exc:
+            raise LoginError(
+                f"IAP 动态票据接口未返回 JSON：HTTP {lt_response.status_code}"
+            ) from exc
+
+        lt = self._find_first(lt_body, {"_lt", "lt", "ltId"})
+        if not lt:
+            raise LoginError("IAP 未返回登录票据")
+
+        need_value = self._find_first(
+            lt_body,
+            {"needCaptcha", "isNeed", "validation"},
+        )
+        if need_value is None:
+            need_response = self.http.post(
+                urljoin(context.auth_host, "iap/checkNeedCaptcha"),
+                data={"username": username, "lt": str(lt)},
                 headers=ajax_headers,
             )
-            try:
-                lt_body = lt_response.json()
-            except ValueError as exc:
-                raise LoginError(
-                    f"IAP 动态票据接口未返回 JSON：HTTP {lt_response.status_code}"
-                ) from exc
-            lt = self._find_first(lt_body, {"_lt", "lt", "ltId"})
-            if not lt:
-                raise LoginError("IAP 未返回登录票据")
-
-            need_value = self._find_first(
-                lt_body,
-                {"needCaptcha", "isNeed", "validation"},
-            )
-            if need_value is None:
-                need_response = self.http.post(
-                    urljoin(context.auth_host, "iap/checkNeedCaptcha"),
-                    data={"username": username, "lt": str(lt)},
-                    headers=ajax_headers,
-                )
+            if need_response.status_code < 400:
                 try:
                     need_body = need_response.json()
                 except ValueError:
@@ -850,93 +852,89 @@ class PasswordAuthService:
                     need_body,
                     {"needCaptcha", "isNeed", "validation"},
                 )
-            need_captcha = force_captcha or self._as_bool(need_value)
-            captcha = ""
-            if need_captcha:
-                captcha_attempts += 1
-                captcha = self._read_image_captcha(
-                    urljoin(context.auth_host, "iap/generateCaptcha"),
-                    "iap_login",
-                    params={"ltId": str(lt)},
-                )
-            form = {
-                "lt": str(lt),
-                "rememberMe": "false",
-                "dllt": context.dllt,
-                "mobile": "",
-                "username": username,
-                "password": encrypt_iap_password(
-                    password,
-                    context.public_key_der_b64,
-                ),
-                "captcha": captcha,
-                "deviceId": self._iap_device_id,
-                "fingerprintId": self._iap_fingerprint_id,
-            }
-            response = self.http.post(
-                urljoin(context.auth_host, "iap/doLogin"),
-                data=form,
-                headers=self._iap_ajax_headers(
-                    context,
-                    device_id=self._iap_device_id,
-                    fingerprint_id=self._iap_fingerprint_id,
-                ),
-                allow_redirects=False,
+
+        if self._as_bool(need_value):
+            raise LoginError(
+                "当前统一认证要求图形验证码，本脚本不提供验证码识别或绕过。"
+                "请先在学校官方认证页面或官方客户端完成验证后再重试。"
             )
-            location = response.headers.get("Location")
-            if response.is_redirect and location:
-                self._follow_iap_redirect(
-                    urljoin(context.auth_host, location)
-                )
-                return
-            try:
-                body = response.json()
-            except ValueError as exc:
-                raise LoginError(
-                    f"IAP 登录失败：HTTP {response.status_code}"
-                ) from exc
-            code = str(
-                self._find_first(body, {"resultCode", "code", "status"}) or ""
-            ).upper()
-            message = str(
-                self._find_first(
-                    body,
-                    {"message", "msg", "resultMessage"},
-                )
-                or ""
+
+        form = {
+            "lt": str(lt),
+            "rememberMe": "false",
+            "dllt": context.dllt,
+            "mobile": "",
+            "username": username,
+            "password": encrypt_iap_password(
+                password,
+                context.public_key_der_b64,
+            ),
+            "captcha": "",
+            "deviceId": self._iap_device_id,
+            "fingerprintId": self._iap_fingerprint_id,
+        }
+        response = self.http.post(
+            urljoin(context.auth_host, "iap/doLogin"),
+            data=form,
+            headers=self._iap_ajax_headers(
+                context,
+                device_id=self._iap_device_id,
+                fingerprint_id=self._iap_fingerprint_id,
+            ),
+            allow_redirects=False,
+        )
+        location = response.headers.get("Location")
+        if response.is_redirect and location:
+            self._follow_iap_redirect(
+                urljoin(context.auth_host, location)
             )
-            jump_value = self._find_first(
+            return
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise LoginError(
+                f"IAP 登录失败：HTTP {response.status_code}"
+            ) from exc
+
+        code = str(
+            self._find_first(body, {"resultCode", "code", "status"}) or ""
+        ).upper()
+        message = str(
+            self._find_first(
                 body,
-                {"url", "redirectUrl", "location"},
+                {"message", "msg", "resultMessage"},
             )
-            if code == "REDIRECT":
-                if not jump_value:
-                    raise LoginError("IAP 登录成功响应缺少跳转地址")
+            or ""
+        )
+        jump_value = self._find_first(
+            body,
+            {"url", "redirectUrl", "location"},
+        )
+
+        if code == "REDIRECT":
+            if not jump_value:
+                raise LoginError("IAP 登录成功响应缺少跳转地址")
+            self._follow_iap_redirect(
+                urljoin(context.auth_host, str(jump_value))
+            )
+            return
+        if code in {"SUCCESS", "OK", "200"}:
+            if jump_value:
                 self._follow_iap_redirect(
                     urljoin(context.auth_host, str(jump_value))
                 )
-                return
-            if code in {"SUCCESS", "OK", "200"}:
-                if jump_value:
-                    self._follow_iap_redirect(
-                        urljoin(context.auth_host, str(jump_value))
-                    )
-                return
-            if code in {"FAIL_UPNOTMATCH", "UPNOTMATCH"}:
-                raise LoginError("用户名或密码不匹配")
-            if code in {"CAPTCHA_NOTMATCH", "CAPTCHA_ERROR"} or self._is_captcha_error(
-                message
-            ):
-                force_captcha = True
-                if captcha_attempts < max_attempts:
-                    print(
-                        "登录验证码未通过，正在刷新票据和图片"
-                        f"（{captcha_attempts + 1}/{max_attempts}）。"
-                    )
-                    continue
-                raise LoginError("登录验证码多次不匹配")
-            raise LoginError(f"IAP 登录失败：{message or code or '未知错误'}")
-        raise LoginError("IAP 登录失败")
+            return
+        if code in {"FAIL_UPNOTMATCH", "UPNOTMATCH"}:
+            raise LoginError("用户名或密码不匹配")
+        if code in {"CAPTCHA_NOTMATCH", "CAPTCHA_ERROR"} or self._is_captcha_error(
+            message
+        ):
+            raise LoginError(
+                "服务端要求或拒绝了图形验证码，本脚本不提供验证码处理。"
+                "请在官方认证页面完成验证后再重试。"
+            )
+        raise LoginError(f"IAP 登录失败：{message or code or '未知错误'}")
 
     def _open_iap_context(self, login_url: str) -> IapLoginContext:
         """访问 IAP 登录入口并读取动态 LT、来源页和 RSA 公钥。"""
@@ -1102,14 +1100,11 @@ class PasswordAuthService:
                 encrypt_cas_password(password, salt) if salt else password
             )
             form_id = form.form_id.lower()
-            captcha_name = self._captcha_input_name(form, form_id)
             if self._cas_needs_captcha(response.url, username, form_id):
-                self._fill_cas_captcha(
-                    params,
-                    response.url,
-                    form_id,
-                    response.text,
-                    captcha_name,
+                raise LoginError(
+                    "当前学校统一认证要求图形验证码或滑块验证，"
+                    "本脚本不提供验证码识别或绕过。"
+                    "请先在学校官方认证页面完成验证后再重试。"
                 )
             rsa_match = re.search(
                 r"RSAKeyPair\(\s*['\"]([^'\"]*)['\"]\s*,"
@@ -1172,330 +1167,137 @@ class PasswordAuthService:
                 return form
         return None
 
-    # def _cas_needs_captcha(
-    #     self,
-    #     login_url: str,
-    #     username: str,
-    #     form_id: str,
-    # ) -> bool:
-    #     parsed = urlparse(login_url)
-    #     host = f"{parsed.scheme}://{parsed.netloc}/"
-    #     try:
-    #         if form_id == "casloginform":
-    #             check = self.http.get(
-    #                 urljoin(host, "authserver/needCaptcha.html"),
-    #                 params={"username": username},
-    #             )
-    #             return "false" not in check.text.lower()
-    #         check = self.http.get(
-    #             urljoin(host, "authserver/checkNeedCaptcha.htl"),
-    #             params={"username": username},
-    #         )
-    #         body = check.json()
-    #         return bool(body.get("isNeed", body.get("needCaptcha", False)))
-    #     except Exception:
-    #         return False
+    def _cas_needs_captcha(
+        self,
+        login_url: str,
+        username: str,
+        form_id: str,
+    ) -> bool:
+        """探测 CAS/authserver 是否要求验证码。
 
-    # def _fill_cas_captcha(
-    #     self,
-    #     params: dict[str, str],
-    #     login_url: str,
-    #     form_id: str,
-    #     html: str,
-    #     captcha_name: str,
-    # ) -> None:
-    #     parsed = urlparse(login_url)
-    #     host = f"{parsed.scheme}://{parsed.netloc}/"
-    #     if "sliderCaptchaDiv" in html:
-    #         create_url = urljoin(
-    #             host,
-    #             "authserver/common/openSliderCaptcha.htl",
-    #         )
-    #         verify_url = urljoin(
-    #             host,
-    #             "authserver/common/verifySliderCaptcha.htl",
-    #         )
-    #         body = self.http.get(create_url).json()
-    #         small_value = str(
-    #             self._find_first(
-    #                 body,
-    #                 {"smallImage", "smallImg", "sliderImage"},
-    #             )
-    #             or ""
-    #         )
-    #         big_value = str(
-    #             self._find_first(
-    #                 body,
-    #                 {"bigImage", "bigImg", "backgroundImage"},
-    #             )
-    #             or ""
-    #         )
-    #         small = self._save_base64_image(small_value, "slider_small")
-    #         big = self._save_base64_image(big_value, "slider_big")
-    #         print(f"滑块图：{small}")
-    #         print(f"背景图：{big}")
-    #         canvas_value = self._find_first(
-    #             body,
-    #             {"canvasLength", "canvasWidth", "imageWidth", "width"},
-    #         )
-    #         try:
-    #             canvas_length = int(float(str(canvas_value)))
-    #         except (TypeError, ValueError):
-    #             canvas_length = 280
-    #         move = int(
-    #             input(
-    #                 f"请输入在 {canvas_length} 像素画布上的滑动距离："
-    #             ).strip()
-    #         )
-    #         verify_data = self._collect_challenge_fields(body)
-    #         verify_data.update(
-    #             {
-    #                 "canvasLength": canvas_length,
-    #                 "moveLength": move,
-    #             }
-    #         )
-    #         verify = self.http.post(verify_url, data=verify_data)
-    #         if verify.status_code >= 400:
-    #             raise LoginError("滑块验证码提交失败")
-    #         try:
-    #             verify_body = verify.json()
-    #         except ValueError:
-    #             verify_body = {"message": verify.text}
-    #         success = self._find_first(
-    #             verify_body,
-    #             {"success", "isSuccess", "validated", "valid"},
-    #         )
-    #         if success is not None and not self._as_bool(success):
-    #             raise LoginError("滑块验证码校验未通过")
-    #         params.update(self._collect_proof_fields(verify_body))
-    #         return
-    #     captcha_url = (
-    #         "authserver/captcha.html"
-    #         if form_id == "casloginform"
-    #         else "authserver/getCaptcha.htl"
-    #     )
-    #     params[captcha_name] = self._read_image_captcha(
-    #         urljoin(host, captcha_url),
-    #         "cas_login",
-    #     )
+        探测失败时返回 False，让服务端登录响应作为最终判断依据。
+        """
+        parsed = urlparse(login_url)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        host = f"{parsed.scheme}://{parsed.netloc}/"
+        try:
+            if form_id == "casloginform":
+                check = self.http.get(
+                    urljoin(host, "authserver/needCaptcha.html"),
+                    params={"username": username},
+                )
+                if check.status_code >= 400:
+                    return False
+                text = check.text.strip().casefold()
+                if text in {"false", "0", "no", "否"}:
+                    return False
+                if text in {"true", "1", "yes", "是"}:
+                    return True
+                try:
+                    body = check.json()
+                except ValueError:
+                    return "false" not in text
+                value = self._find_first(
+                    body,
+                    {"isNeed", "needCaptcha", "validation"},
+                )
+                return self._as_bool(value)
 
-    # def _read_image_captcha(
-    #     self,
-    #     url: str,
-    #     name: str,
-    #     *,
-    #     params: dict[str, str] | None = None,
-    # ) -> str:
-    #     response = self.http.get(url, params=params)
-    #     if response.status_code >= 400:
-    #         raise LoginError(f"验证码下载失败：HTTP {response.status_code}")
-    #     path = self._captcha_path(name)
-    #     path.write_bytes(response.content)
-    #     try:
-    #         if self._captcha_recognizer is None:
-    #             self._captcha_recognizer = NccCaptchaRecognizer()
-    #         result = self._captcha_recognizer.recognize_bytes(
-    #             response.content,
-    #             expected_length=5 if name == "iap_login" else 4,
-    #         )
-    #     except NccCaptchaError as exc:
-    #         raise LoginError(
-    #             f"NCC 验证码自动识别失败，原图已保存到 {path}：{exc}"
-    #         ) from exc
-    #     print(
-    #         f"NCC 验证码自动识别：{result.text} "
-    #         f"（最低匹配分 {result.min_score:.3f}，"
-    #         f"最低区分度 {result.min_margin:.3f}；原图 {path}）"
-    #     )
-    #     return result.text
+            check = self.http.get(
+                urljoin(host, "authserver/checkNeedCaptcha.htl"),
+                params={"username": username},
+            )
+            if check.status_code >= 400:
+                return False
+            try:
+                body = check.json()
+            except ValueError:
+                return self._as_bool(check.text)
+            value = self._find_first(
+                body,
+                {"isNeed", "needCaptcha", "validation"},
+            )
+            return self._as_bool(value)
+        except (CampusError, requests.RequestException, ValueError, TypeError):
+            return False
 
-    # def _save_base64_image(self, value: str, name: str) -> Path:
-    #     """保存并校验 Base64 图片。"""
-    #     if not value:
-    #         raise ProtocolError(f"服务端未返回{name}图片")
-    #     if "," in value:
-    #         value = value.split(",", 1)[1]
-    #     try:
-    #         raw = base64.b64decode(value)
-    #     except (ValueError, TypeError) as exc:
-    #         raise ProtocolError("验证码图片 Base64 无效") from exc
-    #     path = self._captcha_path(name)
-    #     path.write_bytes(raw)
-    #     try:
-    #         with Image.open(path) as image:
-    #             image.verify()
-    #     except Exception as exc:
-    #         raise ProtocolError("服务端返回的验证码图片无效") from exc
-    #     return path
+    @staticmethod
+    def _find_first(node: Any, names: set[str]) -> Any:
+        """递归查找接口响应中的字段，字段名不区分大小写。"""
+        lowered = {name.casefold() for name in names}
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if str(key).casefold() in lowered:
+                    return value
+            for value in node.values():
+                found = PasswordAuthService._find_first(value, names)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = PasswordAuthService._find_first(value, names)
+                if found is not None:
+                    return found
+        return None
 
-    # def _captcha_path(self, name: str) -> Path:
-    #     """生成临时验证码图片路径。"""
-    #     self.http.captcha_dir.mkdir(parents=True, exist_ok=True)
-    #     stamp = f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
-    #     safe_name = re.sub(r"[^0-9A-Za-z_-]+", "_", name)
-    #     return self.http.captcha_dir / f"{safe_name}_{stamp}.png"
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        """兼容接口中的布尔值、数字、文本和嵌套对象。"""
+        if isinstance(value, dict):
+            nested = PasswordAuthService._find_first(
+                value,
+                {"success", "isSuccess", "needCaptcha", "isNeed", "value"},
+            )
+            return PasswordAuthService._as_bool(nested)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        normalized = str(value or "").strip().casefold()
+        return normalized in {
+            "1",
+            "true",
+            "yes",
+            "success",
+            "ok",
+            "need",
+            "needed",
+            "需要",
+            "是",
+        }
 
-    # @staticmethod
-    # def _find_first(node: Any, names: set[str]) -> Any:
-    #     """递归查找接口响应中的字段。"""
-    #     lowered = {name.casefold() for name in names}
-    #     if isinstance(node, dict):
-    #         for key, value in node.items():
-    #             if str(key).casefold() in lowered:
-    #                 return value
-    #         for value in node.values():
-    #             found = PasswordAuthService._find_first(value, names)
-    #             if found is not None:
-    #                 return found
-    #     elif isinstance(node, list):
-    #         for value in node:
-    #             found = PasswordAuthService._find_first(value, names)
-    #             if found is not None:
-    #                 return found
-    #     return None
+    @staticmethod
+    def _is_captcha_error(value: str) -> bool:
+        """识别服务端返回的验证码或滑块验证错误。"""
+        lowered = str(value or "").casefold()
+        return any(
+            word in lowered
+            for word in (
+                "captcha",
+                "验证码",
+                "校验码",
+                "滑块",
+                "行为验证",
+            )
+        )
 
-    # @staticmethod
-    # def _as_bool(value: Any) -> bool:
-    #     """兼容多种布尔表达方式。"""
-    #     if isinstance(value, dict):
-    #         return PasswordAuthService._as_bool(
-    #             PasswordAuthService._find_first(
-    #                 value,
-    #                 {"success", "isSuccess", "needCaptcha", "isNeed"},
-    #             )
-    #         )
-    #     if isinstance(value, bool):
-    #         return value
-    #     if isinstance(value, (int, float)):
-    #         return value != 0
-    #     return str(value or "").strip().casefold() in {
-    #         "1",
-    #         "true",
-    #         "yes",
-    #         "success",
-    #         "ok",
-    #         "需要",
-    #     }
+    @staticmethod
+    def _extract_error(html: str) -> str:
+        """提取认证页面中常见的错误提示，并清理 HTML 标签。"""
+        for pattern in (
+            r'id=["\']errorMsg["\'][^>]*>(.*?)<',
+            r'id=["\']msg["\'][^>]*>(.*?)<',
+            r'class=["\'][^"\']*authError[^"\']*["\'][^>]*>(.*?)<',
+            r'id=["\']formErrorTip2["\'][^>]*>(.*?)<',
+            r'id=["\']showErrorTip["\'][^>]*>(.*?)<',
+        ):
+            match = re.search(pattern, html, re.I | re.S)
+            if match:
+                text = re.sub(r"<[^>]+>", "", match.group(1))
+                return re.sub(r"\s+", " ", text).strip()
+        return ""
 
-    # @staticmethod
-    # def _is_captcha_error(value: str) -> bool:
-    #     """识别验证码错误文本。"""
-    #     lowered = str(value or "").casefold()
-    #     return any(
-    #         word in lowered
-    #         for word in ("captcha", "验证码", "校验码", "滑块")
-    #     )
-
-    # @staticmethod
-    # def _captcha_input_name(
-    #     form: ParsedForm,
-    #     form_id: str,
-    # ) -> str:
-    #     """动态识别验证码字段名。"""
-    #     for item in form.inputs:
-    #         name = item.get("name", "")
-    #         lowered = name.casefold()
-    #         if name and any(
-    #             word in lowered
-    #             for word in (
-    #                 "captcha",
-    #                 "verifycode",
-    #                 "validatecode",
-    #                 "randcode",
-    #             )
-    #         ):
-    #             return name
-    #     return "captchaResponse" if form_id == "casloginform" else "captcha"
-
-    # @staticmethod
-    # def _collect_challenge_fields(node: Any) -> dict[str, Any]:
-    #     """提取滑块验证所需的动态字段。"""
-    #     fields: dict[str, Any] = {}
-    #     excluded = {
-    #         "smallimage",
-    #         "smallimg",
-    #         "sliderimage",
-    #         "bigimage",
-    #         "bigimg",
-    #         "backgroundimage",
-    #         "message",
-    #         "msg",
-    #         "status",
-    #         "success",
-    #     }
-
-    #     def walk(value: Any) -> None:
-    #         if isinstance(value, dict):
-    #             for key, child in value.items():
-    #                 lowered = str(key).casefold()
-    #                 if isinstance(child, (str, int, float, bool)):
-    #                     if (
-    #                         lowered not in excluded
-    #                         and any(
-    #                             marker in lowered
-    #                             for marker in (
-    #                                 "token",
-    #                                 "uuid",
-    #                                 "session",
-    #                                 "captchakey",
-    #                                 "challenge",
-    #                                 "sliderid",
-    #                             )
-    #                         )
-    #                     ):
-    #                         fields[str(key)] = child
-    #                 else:
-    #                     walk(child)
-    #         elif isinstance(value, list):
-    #             for child in value:
-    #                 walk(child)
-
-    #     walk(node)
-    #     return fields
-
-    # @staticmethod
-    # def _collect_proof_fields(node: Any) -> dict[str, str]:
-    #     """提取滑块验证返回的票据字段。"""
-    #     fields: dict[str, str] = {}
-
-    #     def walk(value: Any) -> None:
-    #         if isinstance(value, dict):
-    #             for key, child in value.items():
-    #                 lowered = str(key).casefold()
-    #                 if isinstance(child, (str, int, float)) and any(
-    #                     marker in lowered
-    #                     for marker in (
-    #                         "ticket",
-    #                         "token",
-    #                         "validate",
-    #                         "captcha",
-    #                         "proof",
-    #                     )
-    #                 ):
-    #                     fields[str(key)] = str(child)
-    #                 elif isinstance(child, (dict, list)):
-    #                     walk(child)
-    #         elif isinstance(value, list):
-    #             for child in value:
-    #                 walk(child)
-
-    #     walk(node)
-    #     return fields
-
-    # @staticmethod
-    # def _extract_error(html: str) -> str:
-    #     """提取认证页面中的错误文本。"""
-    #     for pattern in (
-    #         r'id=["\']errorMsg["\'][^>]*>(.*?)<',
-    #         r'id=["\']msg["\'][^>]*>(.*?)<',
-    #         r'class=["\'][^"\']*authError[^"\']*["\'][^>]*>(.*?)<',
-    #         r'id=["\']formErrorTip2["\'][^>]*>(.*?)<',
-    #         r'id=["\']showErrorTip["\'][^>]*>(.*?)<',
-    #     ):
-    #         match = re.search(pattern, html, re.I | re.S)
-    #         if match:
-    #             return re.sub(r"<[^>]+>", "", match.group(1)).strip()
-    #     return ""
 
 
 # ---------------------------------------------------------------------------
@@ -2394,6 +2196,7 @@ class InteractiveLoginApp:
         print("=" * 58)
         print("今日校园登录")
         print("本脚本只执行登录和信息读取，不执行打卡、补签、日报或其他操作")
+        print("本脚本不识别或绕过图形验证码；触发验证码时将停止登录")
         print("=" * 58)
         while True:
             print("\n请选择：")
