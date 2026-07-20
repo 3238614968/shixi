@@ -1,0 +1,49 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment configuration
+.env
+.env.*
+!.env.example
+
+# Runtime files
+runtime/
+**/runtime/
+cache/
+temp/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Test and coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Sensitive files
+*.key
+*.pem
+*.p12
+*.pfx
+cookies.json
+tokens.json
+session.json
